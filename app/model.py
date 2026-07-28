@@ -31,7 +31,8 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 # Path where trained model artefacts live inside the container
-MODEL_DIR = Path("/app/models")
+import os
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "models"))
 MODEL_PATH = MODEL_DIR / "signal_model.pkl"
 CALIBRATOR_PATH = MODEL_DIR / "calibrator.pkl"
 METADATA_PATH = MODEL_DIR / "metadata.json"
