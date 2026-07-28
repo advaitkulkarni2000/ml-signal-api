@@ -1,0 +1,42 @@
+# ── PROMETHEUS CONFIGURATION ──────────────────────────────────────────────────
+#
+# This file tells Prometheus WHERE to scrape metrics from and HOW OFTEN.
+#
+# Prometheus's data model:
+# - A "metric" has a name and optional key=value labels
+# - Each metric has a value at a point in time
+# - Prometheus stores all (metric, labels, timestamp, value) tuples
+# - Grafana queries Prometheus using PromQL (Prometheus Query Language)
+#
+# Example PromQL queries you'd use in Grafana:
+#   rate(prediction_requests_total[5m])        → requests per second
+#   histogram_quantile(0.99, request_latency_ms)  → p99 latency
+#   prediction_requests_total{status="error"}   → total errors
+# ──────────────────────────────────────────────────────────────────────────────
+
+global:
+  scrape_interval: 15s       # scrape every 15 seconds
+  evaluation_interval: 15s   # evaluate alerting rules every 15 seconds
+
+scrape_configs:
+  # ── Scrape our ML API ──────────────────────────────────────────────────────
+  - job_name: "ml-signal-api"
+
+    # Static targets: always scrape this endpoint
+    # "api" = the service name in docker-compose.yml
+    # Docker's internal DNS resolves "api" to the container's IP
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: "ml-signal-api"
+          environment: "local"
+
+    # The path where our app exposes metrics
+    # This matches the @app.get("/metrics") route in main.py
+    metrics_path: "/metrics"
+
+  # ── Scrape Prometheus itself ──────────────────────────────────────────────
+  # Prometheus exposes its own metrics (useful for monitoring the monitor)
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
