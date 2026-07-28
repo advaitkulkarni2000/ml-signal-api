@@ -1,0 +1,143 @@
+# ── DOCKER COMPOSE ────────────────────────────────────────────────────────────
+#
+# Docker Compose orchestrates multiple containers together.
+# Instead of running `docker run ...` for each service separately,
+# you define all services here and start everything with:
+#
+#   docker compose up
+#
+# This starts:
+#   - ml-signal-api: your FastAPI application
+#   - prometheus: scrapes metrics from the API every 15 seconds
+#   - grafana: reads from Prometheus and displays dashboards
+#
+# All three containers are on the same internal network ("ml-network")
+# so they can talk to each other by service name (e.g. "api:8000").
+# Only the ports listed under "ports" are accessible from your laptop.
+#
+# --- HOW THE MONITORING STACK CONNECTS ---
+# Your laptop  →  port 8000  →  ml-signal-api container
+# Your laptop  →  port 9090  →  Prometheus container
+# Your laptop  →  port 3000  →  Grafana container
+# Prometheus   →  api:8000/metrics  →  scrapes every 15s (internal network)
+# Grafana      →  prometheus:9090   →  queries for dashboard data
+# ──────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  # ── ML Signal API ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..           # build context = parent directory (project root)
+      dockerfile: docker/Dockerfile
+    container_name: ml-signal-api
+
+    ports:
+      - "8000:8000"         # host_port:container_port
+                            # your laptop's 8000 → container's 8000
+
+    volumes:
+      # Mount the local models/ directory into the container.
+      # This means: train a model locally, and the running container
+      # immediately sees it WITHOUT rebuilding the image.
+      # This is the development workflow:
+      #   1. Run: python -m training.train
+      #   2. Model saved to ./models/
+      #   3. Container picks it up via this volume mount
+      - ../models:/app/models
+
+      # Mount MLflow tracking data so runs persist across container restarts
+      - ../mlruns:/app/mlruns
+
+    environment:
+      # Environment variables injected into the container
+      - MODEL_DIR=/app/models
+      - MLFLOW_TRACKING_URI=/app/mlruns
+      - LOG_LEVEL=INFO
+
+    # Health check at the compose level
+    # compose uses this to determine if the service is ready
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s    # wait 40s before first health check (startup time)
+
+    # Restart policy: restart the container if it crashes
+    # "unless-stopped" = restart always except when manually stopped
+    restart: unless-stopped
+
+    networks:
+      - ml-network
+
+  # ── Prometheus ───────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0    # official Prometheus image (no build needed)
+    container_name: prometheus
+
+    ports:
+      - "9090:9090"         # Prometheus UI at localhost:9090
+
+    volumes:
+      # Mount our Prometheus configuration file
+      # prometheus.yml tells Prometheus WHERE to scrape metrics from
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro  # :ro = read-only
+      - prometheus_data:/prometheus    # persist time-series data
+
+    command:
+      # Override the default Prometheus command with our config file path
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'   # keep 15 days of metrics
+      - '--web.enable-lifecycle'               # allow config reload via API
+
+    restart: unless-stopped
+    networks:
+      - ml-network
+
+  # ── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0     # official Grafana image
+    container_name: grafana
+
+    ports:
+      - "3000:3000"         # Grafana UI at localhost:3000
+                            # Default login: admin/admin
+
+    volumes:
+      - grafana_data:/var/lib/grafana             # persist dashboards and settings
+      - ./grafana/provisioning:/etc/grafana/provisioning  # auto-configure datasource
+
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin   # change this in production!
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+
+    # Grafana depends on Prometheus being healthy before starting
+    depends_on:
+      - prometheus
+
+    restart: unless-stopped
+    networks:
+      - ml-network
+
+
+# ── NETWORKS ──────────────────────────────────────────────────────────────────
+# Named network that all services share.
+# Containers on the same network can reach each other by service name.
+# "api", "prometheus", "grafana" are all valid hostnames within ml-network.
+networks:
+  ml-network:
+    driver: bridge         # default network driver (NAT-based)
+
+
+# ── VOLUMES ───────────────────────────────────────────────────────────────────
+# Named volumes persist data across container restarts.
+# Without these, Prometheus time-series data and Grafana dashboards
+# would be lost every time you run `docker compose down`.
+volumes:
+  prometheus_data:
+  grafana_data:
