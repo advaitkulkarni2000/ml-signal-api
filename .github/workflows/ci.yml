@@ -1,0 +1,109 @@
+# ── GITHUB ACTIONS CI ─────────────────────────────────────────────────────────
+#
+# GitHub Actions is a CI/CD platform built into GitHub.
+# This file defines a "workflow" — a series of steps that run automatically
+# when you push code or open a pull request.
+#
+# --- WHAT IS CI? ---
+# Continuous Integration: automatically run tests on every code change.
+# If tests pass → your code change is safe to merge.
+# If tests fail → GitHub shows a red X on the commit and blocks the merge.
+#
+# This runs:
+#   1. Every push to main or develop branch
+#   2. Every pull request against main
+#
+# GitHub provides free CI minutes for public repos.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: CI Pipeline
+
+# ── TRIGGERS: when does this workflow run? ────────────────────────────────────
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  # ── JOB 1: Run tests ────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest    # GitHub provides Ubuntu VMs for free
+
+    steps:
+      # Step 1: Check out the code
+      # This downloads your repository into the VM
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Step 3: Cache pip packages
+      # If requirements.txt hasn't changed, skip reinstalling packages.
+      # Speeds up CI from ~3min to ~30sec on cache hit.
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # Step 4: Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest-asyncio
+
+      # Step 5: Run tests
+      # -v = verbose output (show each test name)
+      # --tb=short = show short traceback on failure
+      # -x = stop on first failure (fail fast)
+      - name: Run pytest
+        run: |
+          pytest tests/ -v --tb=short -x
+        env:
+          # Tell pytest-asyncio to auto-detect async tests
+          PYTESTASYNCIO_MODE: auto
+
+      # Step 6: Check code style with flake8
+      # E501 = line too long (ignore — our comments are long)
+      # W503 = line break before binary operator (ignore — stylistic)
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          flake8 app/ training/ --max-line-length=100 --ignore=E501,W503 --count
+        continue-on-error: true   # don't fail CI on style warnings
+
+  # ── JOB 2: Build Docker image ──────────────────────────────────────────────
+  docker-build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test    # only run if tests pass
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Set up Docker Buildx (extended build capabilities)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the Docker image (but don't push — no registry credentials needed)
+      # This validates that the Dockerfile is correct
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false           # don't push to registry (just validate the build)
+          tags: ml-signal-api:latest
+          cache-from: type=gha  # use GitHub Actions cache for faster builds
+          cache-to: type=gha,mode=max
