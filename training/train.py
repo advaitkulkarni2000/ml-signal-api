@@ -59,15 +59,13 @@ logger = logging.getLogger(__name__)
 # The universe of stocks to train on — S&P 500 large caps + some tech
 # In production you'd use a proper index constituent list
 TRAINING_UNIVERSE = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "BRK-B",
-    "JPM", "JNJ", "V", "PG", "UNH", "HD", "MA", "DIS", "PYPL", "NFLX",
-    "ADBE", "CRM", "INTC", "AMD", "QCOM", "TXN", "AVGO", "MU", "AMAT",
-    "BAC", "WFC", "GS", "MS", "C", "AXP", "BLK", "SPGI",
-    "XOM", "CVX", "COP", "SLB", "EOG",
-    "PFE", "MRK", "ABBV", "BMY", "AMGN", "GILD",
-    "WMT", "COST", "TGT", "KO", "PEP", "MCD", "SBUX",
-    "NEE", "DUK", "SO", "D",
-    "AMT", "PLD", "CCI",
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
+    "JPM", "JNJ", "V", "PG", "MA", "NFLX",
+    "ADBE", "CRM", "INTC", "AMD", "QCOM", "TXN", "AVGO",
+    "BAC", "WFC", "GS", "AXP", "SPGI",
+    "XOM", "CVX", "SLB",
+    "PFE", "MRK", "ABBV", "AMGN",
+    "WMT", "COST", "KO", "PEP", "MCD",
 ]
 
 # LightGBM hyperparameters

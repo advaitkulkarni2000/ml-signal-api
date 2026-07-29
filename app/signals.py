@@ -1,103 +1,123 @@
 """
 signals.py — Signal computation engine.
 
-This is the core ML/quantitative logic: takes raw price data and
-computes alpha signals for each stock. These signals are then fed
-into the LightGBM model for final return prediction.
-
-Signals implemented (matching your original signal research framework):
-  1. Cross-sectional momentum (1-month, 3-month, 6-month)
-  2. Z-score mean reversion (short-term)
-  3. Volatility regime (rolling vol)
-  4. Volume-adjusted momentum
-
-Each signal is cross-sectionally z-scored (mean 0, std 1 across all
-tickers at each time step). This is critical: we normalise WITHIN
-each date, not across time, to avoid look-ahead bias.
+Uses a browser-spoofing requests session to avoid Yahoo Finance rate limiting.
+Downloads tickers one at a time using yf.Ticker(session=session) which is
+more reliable than yf.download() for avoiding 429/403 errors.
 """
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
 import logging
-from typing import Optional
+import time
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
+
+# ── BROWSER SESSION ───────────────────────────────────────────────────────────
+
+def make_session() -> requests.Session:
+    """
+    Create a requests session with browser-like headers.
+
+    Yahoo Finance blocks requests that look like bots (no User-Agent).
+    Adding a real browser User-Agent string bypasses this check.
+    The session object is reused across all ticker downloads so we
+    don't create a new TCP connection for every request.
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    return session
 
 
 # ── DATA FETCHING ─────────────────────────────────────────────────────────────
 
 def fetch_price_data(
     tickers: list[str],
-    lookback_days: int = 252
+    lookback_days: int = 252,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
-    Download OHLCV data from Yahoo Finance for all tickers.
+    Download adjusted close prices for all tickers using browser session.
+
+    Downloads one ticker at a time with a short delay between each.
+    This is slower than bulk download but avoids Yahoo Finance rate limits.
 
     Returns:
-        prices: DataFrame with adjusted close prices (rows=dates, cols=tickers)
-        failed: list of tickers that couldn't be fetched
-
-    --- WHY ADJUSTED CLOSE? ---
-    Raw close prices include corporate actions: stock splits, dividends.
-    If AAPL splits 4:1, the raw price drops 75% overnight — not a real
-    return. Adjusted close prices retroactively correct for these events
-    so that returns computed from consecutive adjusted closes are real
-    economic returns. Always use adjusted close for return computation.
+        prices: DataFrame (rows=dates, cols=tickers)
+        failed: list of tickers that could not be fetched
     """
-    # yfinance accepts a list of tickers and a period
-    # period="1y" = 1 calendar year ≈ 252 trading days
-    period_map = {
-        60:  "3mo",
-        126: "6mo",
-        252: "1y",
-        504: "2y",
-        756: "3y",
-    }
-    # Find closest period
+    # Map lookback days to yfinance period string
+    period_map = {60: "3mo", 126: "6mo", 252: "1y", 504: "2y", 756: "3y"}
     period = "1y"
     for days, p in sorted(period_map.items()):
         if lookback_days <= days:
             period = p
             break
 
-    logger.info(f"Fetching {len(tickers)} tickers, period={period}")
+    logger.info(f"Fetching {len(tickers)} tickers one by one, period={period}")
 
-    try:
-        raw = yf.download(
-            tickers,
-            period=period,
-            auto_adjust=True,    # use adjusted close
-            progress=False,      # suppress download progress bar
-            threads=True,        # parallel downloads
-        )
-    except Exception as e:
-        logger.error(f"yfinance download failed: {e}")
-        raise
+    session = make_session()
+    yf.set_tz_cache_location("/tmp")
 
-    # yfinance returns MultiIndex columns when multiple tickers
-    # Shape: (dates, tickers) for single price field
-    if isinstance(raw.columns, pd.MultiIndex):
-        prices = raw["Close"]
-    else:
-        prices = raw[["Close"]]
-        prices.columns = tickers[:1]
-
-    # Find tickers that returned insufficient data
+    all_prices = {}
     failed = []
-    valid_tickers = []
-    for t in tickers:
-        if t not in prices.columns:
-            failed.append(t)
-        elif prices[t].dropna().shape[0] < 60:
-            logger.warning(f"{t}: only {prices[t].dropna().shape[0]} rows, skipping")
-            failed.append(t)
-        else:
-            valid_tickers.append(t)
 
-    prices = prices[valid_tickers].dropna(how="all")
+    for i, ticker in enumerate(tickers):
+        try:
+            # Use Ticker object with session — more reliable than yf.download
+            t = yf.Ticker(ticker, session=session)
+            hist = t.history(period=period, auto_adjust=True)
 
-    logger.info(f"Fetched {len(valid_tickers)} tickers, {len(failed)} failed")
+            if hist.empty or len(hist) < 60:
+                logger.warning(f"{ticker}: insufficient data ({len(hist)} rows)")
+                failed.append(ticker)
+                continue
+
+            # history() returns a DataFrame with columns: Open High Low Close Volume
+            all_prices[ticker] = hist["Close"]
+            logger.info(f"  [{i+1}/{len(tickers)}] {ticker}: {len(hist)} rows OK")
+
+        except Exception as e:
+            logger.warning(f"  [{i+1}/{len(tickers)}] {ticker}: failed — {e}")
+            failed.append(ticker)
+
+        # Short delay between requests to avoid rate limiting
+        # 0.5 seconds gives ~2 requests/sec which Yahoo tolerates
+        time.sleep(0.5)
+
+    if not all_prices:
+        raise ValueError(
+            "No price data fetched for any ticker. "
+            "Check network connection or try again in a few minutes."
+        )
+
+    prices = pd.DataFrame(all_prices)
+    prices.index = pd.to_datetime(prices.index)
+
+    # Remove timezone info from index (causes issues with some pandas operations)
+    if prices.index.tz is not None:
+        prices.index = prices.index.tz_localize(None)
+
+    prices = prices.dropna(how="all")
+
+    logger.info(
+        f"Fetch complete: {len(all_prices)} succeeded, "
+        f"{len(failed)} failed"
+        + (f" ({failed})" if failed else "")
+    )
+
     return prices, failed
 
 
@@ -105,20 +125,10 @@ def fetch_price_data(
 
 def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute log returns from price series.
+    Log returns: log(P_t / P_{t-1})
 
-    Log return = log(P_t / P_{t-1})
-
-    --- WHY LOG RETURNS? ---
-    Simple returns r = (P_t - P_{t-1}) / P_{t-1} have two problems:
-    1. Not additive across time: a 50% gain then a 50% loss ≠ 0%.
-    2. Bounded below at -100% but unbounded above — asymmetric.
-
-    Log returns solve both: log(P_t/P_{t-1}) ARE additive across time
-    (log returns over a week = sum of daily log returns), and they're
-    approximately normally distributed for small changes.
-
-    For signal computation we use log returns throughout.
+    Additive across time: weekly return = sum of daily log returns.
+    Approximately normally distributed for small price changes.
     """
     return np.log(prices / prices.shift(1)).dropna(how="all")
 
@@ -127,19 +137,12 @@ def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
 
 def cross_sectional_zscore(series: pd.Series) -> pd.Series:
     """
-    Z-score a series cross-sectionally: subtract mean, divide by std.
+    Normalise across tickers at a single point in time.
 
     result_i = (x_i - mean(x)) / std(x)
 
-    --- WHY CROSS-SECTIONAL, NOT TIME-SERIES? ---
-    If we z-score using historical mean/std (time-series), we'd be using
-    future information at each point — because the mean computed over
-    the full history includes data from after the prediction date.
-    Cross-sectional z-scoring computes mean/std ACROSS all tickers
-    at a SINGLE point in time. No future information leaks in.
-
-    This is one of the most common bugs in quant research: normalising
-    across time instead of across the cross-section.
+    Cross-sectional (not time-series) to avoid look-ahead bias:
+    mean and std are computed across tickers TODAY, not across history.
     """
     mean = series.mean()
     std = series.std()
@@ -148,110 +151,66 @@ def cross_sectional_zscore(series: pd.Series) -> pd.Series:
     return (series - mean) / std
 
 
-# ── INDIVIDUAL SIGNALS ────────────────────────────────────────────────────────
+# ── SIGNAL FUNCTIONS ──────────────────────────────────────────────────────────
 
 def momentum_signal(returns: pd.DataFrame, window: int = 21) -> pd.Series:
     """
-    Cross-sectional momentum: cumulative return over [window] days.
-
-    For each ticker, compute the sum of log returns over the window.
-    Then z-score across tickers at this point in time.
-
-    Intuition: stocks that have gone up recently tend to keep going up
-    (momentum effect). This is one of the most robust documented
-    anomalies in academic finance.
-
-    window=21 ≈ 1 month, window=63 ≈ 3 months, window=126 ≈ 6 months.
+    Cross-sectional momentum: cumulative return over window trading days.
+    window=21 ≈ 1 month, 63 ≈ 3 months, 126 ≈ 6 months.
     """
-    cumulative = returns.tail(window).sum()  # sum of log returns over window
-    return cross_sectional_zscore(cumulative)
+    return cross_sectional_zscore(returns.tail(window).sum())
 
 
 def mean_reversion_signal(returns: pd.DataFrame, window: int = 5) -> pd.Series:
     """
-    Short-term mean reversion: negative of recent return.
-
-    Stocks that have dropped sharply in the short term (1-2 weeks)
-    tend to bounce back — the opposite of momentum at short horizons.
-
-    In your original framework, this signal had ICIR=1.81 at 1-day
-    horizon and decayed to 0.38 at 21 days. This is the highest-IC
-    signal in the framework.
+    Short-term mean reversion: negated 5-day return.
+    Highest-IC signal in the original framework (ICIR=1.81 at 1-day horizon).
     """
-    short_return = returns.tail(window).sum()
-    return cross_sectional_zscore(-short_return)  # negate: high recent drop → positive signal
+    return cross_sectional_zscore(-returns.tail(window).sum())
 
 
 def volatility_signal(returns: pd.DataFrame, window: int = 21) -> pd.Series:
     """
-    Volatility regime signal: low-vol stocks tend to outperform.
-
-    This is the "low-volatility anomaly" — counter to CAPM theory,
-    lower volatility stocks have historically delivered better
-    risk-adjusted returns. We z-score and negate (lower vol → higher signal).
+    Low-volatility anomaly: lower-vol stocks tend to outperform.
+    Negated so higher signal = lower volatility = stronger long candidate.
     """
-    vol = returns.tail(window).std()
-    return cross_sectional_zscore(-vol)  # negate: lower vol → higher signal
+    return cross_sectional_zscore(-returns.tail(window).std())
 
 
 def volume_momentum_signal(
     prices: pd.DataFrame,
     returns: pd.DataFrame,
-    window: int = 10
+    window: int = 10,
 ) -> pd.Series:
     """
-    Volume-adjusted momentum: price momentum weighted by trading volume.
-
-    High-volume up moves are stronger signals than low-volume up moves.
-    We can't directly get volume from our current setup without extra
-    API calls, so we approximate using price volatility as a proxy.
+    Momentum adjusted by inverse volatility.
+    High-vol price moves are noisier signals than low-vol moves.
     """
-    # Proxy: momentum weighted by inverse volatility (high-vol moves less reliable)
     mom = returns.tail(window).sum()
     vol_proxy = returns.tail(window).std().replace(0, np.nan)
-    adjusted = mom / vol_proxy
-    return cross_sectional_zscore(adjusted.fillna(0))
+    return cross_sectional_zscore((mom / vol_proxy).fillna(0))
 
 
 # ── FEATURE MATRIX ────────────────────────────────────────────────────────────
 
-def compute_feature_matrix(
-    prices: pd.DataFrame,
-) -> pd.DataFrame:
+def compute_feature_matrix(prices: pd.DataFrame) -> pd.DataFrame:
     """
-    Build the full feature matrix for model inference.
+    Build the 6-feature matrix for LightGBM inference.
 
-    Each row = one ticker. Each column = one signal.
-    This is the input to the LightGBM model.
-
-    --- ML SIDE: FEATURE ENGINEERING ---
-    Feature engineering is often more important than model choice.
-    A simple model with good features beats a complex model with bad
-    features almost every time. Here we compute:
-    - 3 momentum signals at different horizons (1mo, 3mo, 6mo)
-    - 1 mean reversion signal (5-day)
-    - 1 volatility signal (21-day)
-    - 1 volume-momentum signal (10-day)
-    = 6 features total
-
-    All features are cross-sectionally z-scored → mean 0, std 1.
-    This means the LightGBM model sees relative rankings between
-    stocks, not absolute levels. This is crucial because absolute
-    price levels are meaningless for cross-sectional prediction.
+    Each row = one ticker.
+    Each column = one cross-sectionally z-scored signal.
+    All features have mean≈0, std≈1 across the requested ticker universe.
     """
     returns = compute_returns(prices)
 
     features = pd.DataFrame(index=prices.columns)
+    features["momentum_1m"]    = momentum_signal(returns, window=21)
+    features["momentum_3m"]    = momentum_signal(returns, window=63)
+    features["momentum_6m"]    = momentum_signal(returns, window=126)
+    features["mean_reversion"] = mean_reversion_signal(returns, window=5)
+    features["volatility"]     = volatility_signal(returns, window=21)
+    features["vol_momentum"]   = volume_momentum_signal(prices, returns, window=10)
 
-    features["momentum_1m"]     = momentum_signal(returns, window=21)
-    features["momentum_3m"]     = momentum_signal(returns, window=63)
-    features["momentum_6m"]     = momentum_signal(returns, window=126)
-    features["mean_reversion"]  = mean_reversion_signal(returns, window=5)
-    features["volatility"]      = volatility_signal(returns, window=21)
-    features["vol_momentum"]    = volume_momentum_signal(prices, returns, window=10)
-
-    # Drop any tickers where we couldn't compute all features
     features = features.dropna()
-
-    logger.info(f"Feature matrix shape: {features.shape}")
+    logger.info(f"Feature matrix: {features.shape[0]} tickers x {features.shape[1]} signals")
     return features
